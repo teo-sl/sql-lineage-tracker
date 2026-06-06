@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sql-lineage"
+version = "0.1.0"
+description = "SQL Lineage Tracker — table & column lineage from SQL files"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "sqlglot>=26.0.0",
+    "graphviz>=0.20",
+    "pyvis>=0.3.2",
+    "networkx>=3.0"
+]
+
+[project.scripts]
+sql-lineage = "sql_lineage.lineage_tracker:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sql_lineage"]
