@@ -261,6 +261,11 @@ class SQLParser:
             for st, _ in c.sources:
                 all_sources.add(st)
 
+        for join_info in all_joins:
+            right = join_info.get("right", "")
+            if right:
+                all_sources.add(right)
+
         self.tables[table_name] = TableInfo(
             name=table_name,
             columns=columns,
