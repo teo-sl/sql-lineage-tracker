@@ -53,6 +53,7 @@ class ColumnLineage:
     name: str
     expression: str  # original SQL expression text
     sources: List[Tuple[str, str]]  # [(source_table, source_col), ...]
+    data_type: str = ""   # SQL data type (from DDL or inferred)
 
 
 @dataclass
@@ -68,6 +69,7 @@ class TableInfo:
     joins: List[Dict] = field(default_factory=list)  # [{left, right, condition, kind}]
     is_union: bool = False
     union_branches: List[Dict] = field(default_factory=list)  # [{table, operator}]
+    group_by: List[str] = field(default_factory=list)
 
 
 
@@ -95,9 +97,62 @@ class SQLLineageTracker:
         print(f"\n📂  Parsing {len(sql_files)} SQL files from {sql_dir}/\n")
         for f in sql_files:
             self._parse_file(f)
+        
+        self.resolve_inherited_types()
         print()
 
     # ── parsing internals ────────────────────────────────────────
+
+    def resolve_inherited_types(self) -> None:
+        """Second pass: propagate data types forward from source columns to derived columns."""
+        resolved_cache = {}
+
+        def _get_type(table_name: str, col_name: str, visited: Set[Tuple[str, str]]) -> str:
+            key = (table_name, col_name)
+            if key in resolved_cache:
+                return resolved_cache[key]
+            
+            if key in visited:  # Prevent infinite loops in recursive CTEs
+                return "UNKNOWN"
+            visited.add(key)
+
+            tinfo = self.tables.get(table_name)
+            if not tinfo:
+                return "UNKNOWN"
+            
+            # Find the column
+            col = next((c for c in tinfo.columns if c.name == col_name), None)
+            if not col:
+                return "UNKNOWN"
+            
+            # If it has a concrete type already, we are good
+            if col.data_type and col.data_type not in ("INHERITED", "UNKNOWN"):
+                resolved_cache[key] = col.data_type
+                return col.data_type
+            
+            # Otherwise, resolve from sources
+            inferred_types = set()
+            for src_t, src_c in col.sources:
+                t = _get_type(src_t, src_c, visited)
+                if t not in ("INHERITED", "UNKNOWN", ""):
+                    inferred_types.add(t)
+            
+            # If we found exactly one consistent type, use it. If mixed or none, UNKNOWN.
+            if len(inferred_types) == 1:
+                res = inferred_types.pop()
+            else:
+                res = "UNKNOWN"
+                
+            resolved_cache[key] = res
+            return res
+
+        for tname, tinfo in self.tables.items():
+            for col in tinfo.columns:
+                if not col.data_type or col.data_type in ("INHERITED", "UNKNOWN"):
+                    t = _get_type(tname, col.name, set())
+                    if t != "UNKNOWN":
+                        col.data_type = t
+
 
     def _parse_file(self, filepath: Path) -> None:
         sql = filepath.read_text()
@@ -134,14 +189,17 @@ class SQLLineageTracker:
     def _analyze_source_table(
         self, table_name: str, stmt: exp.Create, filename: str
     ) -> None:
-        columns = [
-            ColumnLineage(
-                name=(n := cdef.name.lower()),
+        columns = []
+        for cdef in stmt.find_all(exp.ColumnDef):
+            n = cdef.name.lower()
+            # Extract declared SQL type from DDL, e.g. VARCHAR(255), INTEGER, TIMESTAMP
+            dtype = cdef.kind.sql(dialect=self.dialect).upper() if cdef.kind else ""
+            columns.append(ColumnLineage(
+                name=n,
                 expression=n,
                 sources=[(table_name, n)],
-            )
-            for cdef in stmt.find_all(exp.ColumnDef)
-        ]
+                data_type=dtype,
+            ))
         self.tables[table_name] = TableInfo(
             name=table_name,
             columns=columns,
@@ -210,6 +268,7 @@ class SQLLineageTracker:
         all_joins: List[Dict] = []
         all_sources: Set[str] = set()
         union_branches: List[Dict] = []  # [{table, operator}]
+        all_group_by: List[str] = []
         
         for select_node, operator in branch_tuples:
             alias_map = self._build_alias_map(select_node, filename, cte_map)
@@ -232,6 +291,22 @@ class SQLLineageTracker:
                 all_filters.append(select_node.args["where"].sql(dialect=self.dialect))
             if select_node.args.get("having"):
                 all_filters.append(select_node.args["having"].sql(dialect=self.dialect))
+
+            # GROUP BY columns
+            group_node = select_node.args.get("group")
+            if group_node:
+                for g_expr in group_node.expressions:
+                    g_copy = g_expr.copy()
+                    for col in g_copy.find_all(exp.Column):
+                        if col.table:
+                            t_lower = col.table.lower()
+                            resolved = alias_map.get(t_lower)
+                            if resolved:
+                                col.set("table", exp.to_identifier(resolved))
+                    
+                    g_sql = g_copy.sql(dialect=self.dialect)
+                    if g_sql not in all_group_by:
+                        all_group_by.append(g_sql)
                 
             for join in select_node.args.get("joins") or []:
                 # Build full join type: [side] [kind] JOIN  e.g. LEFT JOIN, INNER JOIN, CROSS JOIN
@@ -267,10 +342,65 @@ class SQLLineageTracker:
                     "condition": condition
                 })
                 
+            # If the FROM table has a PIVOT, extract the pivoted columns and their generation logic
+            pivot_columns = {}
+            if from_clause and isinstance(from_clause.this, exp.Table) and from_clause.this.args.get("pivots"):
+                for pivot in from_clause.this.args["pivots"]:
+                    if not pivot.args.get("unpivot"):
+                        # Try to construct a readable PIVOT expression and infer its type
+                        agg_expr_str = ""
+                        dtype = "INHERITED"
+                        if pivot.args.get("expressions"):
+                            agg_expr = pivot.args["expressions"][0]
+                            agg_expr_str = agg_expr.sql(dialect=self.dialect)
+                            dtype = self._infer_type(agg_expr)
+                        
+                        field_expr = ""
+                        if pivot.args.get("fields"):
+                            field_expr = pivot.args["fields"][0].this.sql(dialect=self.dialect)
+                            for e in pivot.args["fields"][0].expressions:
+                                if isinstance(e, exp.PivotAlias):
+                                    col_alias = e.args.get("alias")
+                                    if col_alias is None:
+                                        col_alias = getattr(e, "alias", None)
+                                    if col_alias:
+                                        col_name = col_alias if isinstance(col_alias, str) else getattr(col_alias, "name", str(col_alias))
+                                        col_name = col_name.lower()
+                                        val_expr = e.this.sql(dialect=self.dialect)
+                                        pivot_columns[col_name] = (f"PIVOT: {agg_expr_str} FOR {field_expr} = {val_expr}", dtype)
+                        
+                        # Fallback for columns
+                        if not pivot_columns and pivot.args.get("columns"):
+                            for c in pivot.args["columns"]:
+                                col_name = c.name.lower()
+                                pivot_columns[col_name] = (f"PIVOT operation on {agg_expr_str}" if agg_expr_str else "PIVOT operation", dtype)
+
             for sel_expr in select_node.expressions:
+                if isinstance(sel_expr, exp.Star) and pivot_columns:
+                    # Expand * into the pivoted columns manually
+                    for pcol, (pexpr, pdtype) in pivot_columns.items():
+                        c = ColumnLineage(
+                            name=pcol,
+                            expression=pexpr,
+                            sources=[(from_table, pcol)],
+                            data_type=pdtype
+                        )
+                        if c.name not in all_columns:
+                            all_columns[c.name] = c
+                    continue
+
                 col = self._trace_output_column_shallow(sel_expr, alias_map, cte_map)
                 if col:
+                    if col.name in pivot_columns:
+                        col.expression = pivot_columns[col.name][0]
+                        dtype = pivot_columns[col.name][1]
+                    else:
+                        # Infer data type from the expression
+                        inner_expr = sel_expr.this if isinstance(sel_expr, exp.Alias) else sel_expr
+                        dtype = self._infer_type(inner_expr)
+                        
                     if col.name not in all_columns:
+                        col.data_type = dtype
                         all_columns[col.name] = col
                     else:
                         existing = all_columns[col.name]
@@ -292,7 +422,8 @@ class SQLLineageTracker:
             filters=all_filters,
             joins=all_joins,
             is_union=len(branch_tuples) > 1,
-            union_branches=union_branches
+            union_branches=union_branches,
+            group_by=list(all_group_by)
         )
         print(
             f"  ✅ {filename:<35} → parsed node:     {table_name}  "
@@ -300,6 +431,115 @@ class SQLLineageTracker:
         )
 
     # ── AST helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _infer_type(expr: exp.Expression) -> str:
+        """Best-effort type inference from a SQL expression."""
+        # Unwrap alias
+        if isinstance(expr, exp.Alias):
+            return SQLLineageTracker._infer_type(expr.this)
+        # Explicit CAST
+        if isinstance(expr, exp.Cast):
+            return expr.to.sql().upper()
+        # TryCast
+        if isinstance(expr, exp.TryCast):
+            return expr.to.sql().upper()
+        # Lag / Lead / First / Last → inherit (we can't know without source)
+        _inherit_fns = []
+        for cls_name in ("Lag", "Lead", "First", "Last", "NthValue"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _inherit_fns.append(cls)
+        if _inherit_fns and isinstance(expr, tuple(_inherit_fns)):
+            return "INHERITED"
+        # Date/time functions
+        _date_fns = []
+        for cls_name in ("DateTrunc", "TsOrDsToDate", "CurrentDate", "Date",
+                         "DateFromParts", "ToDate", "DateAdd", "DateSub",
+                         "TimestampTrunc"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _date_fns.append(cls)
+        if _date_fns and isinstance(expr, tuple(_date_fns)):
+            return "DATE"
+        _ts_fns = []
+        for cls_name in ("CurrentTimestamp", "Now", "TimeToStr", "StrToTime",
+                         "CurrentTime", "UnixToTime", "TimeAdd"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _ts_fns.append(cls)
+        if _ts_fns and isinstance(expr, tuple(_ts_fns)):
+            return "TIMESTAMP"
+        # String functions
+        _str_fns = []
+        for cls_name in ("Lower", "Upper", "Trim", "Concat", "Substring",
+                         "RegexpExtract", "ToString", "ToChar", "LTrim",
+                         "RTrim", "Left", "Right", "Length", "CharLength",
+                         "Replace", "Initcap", "SafeConcat", "Repeat"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _str_fns.append(cls)
+        if _str_fns and isinstance(expr, tuple(_str_fns)):
+            return "TEXT"
+        # Arithmetic → numeric
+        _arith_fns = []
+        for cls_name in ("Add", "Sub", "Mul", "Div", "Paren", "Round",
+                         "Floor", "Ceil", "Abs", "Pow", "Mod", "Neg",
+                         "Greatest", "Least", "Sqrt", "Exp", "Ln", "Log"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _arith_fns.append(cls)
+        if _arith_fns and isinstance(expr, tuple(_arith_fns)):
+            return "NUMERIC"
+        # Boolean / comparison
+        _bool_fns = []
+        for cls_name in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE",
+                         "In", "Like", "Is", "Not", "And", "Or", "Between",
+                         "ILike", "RegexpLike"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _bool_fns.append(cls)
+        if _bool_fns and isinstance(expr, tuple(_bool_fns)):
+            return "BOOLEAN"
+        # Aggregations → numeric
+        _numeric_aggs = []
+        for cls_name in ("Sum", "Avg", "Stddev", "Variance", "Min", "Max",
+                         "ApproxDistinct", "ApproxQuantile", "Corr", "CovarPop",
+                         "CovarSamp", "StddevPop", "StddevSamp", "VarPop", "VarSamp"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _numeric_aggs.append(cls)
+        if _numeric_aggs and isinstance(expr, tuple(_numeric_aggs)):
+            return "NUMERIC"
+        # Count / ranking → integer
+        _int_aggs = []
+        for cls_name in ("Count", "Rank", "DenseRank", "RowNumber", "Ntile",
+                         "CumeDist", "PercentRank"):
+            cls = getattr(exp, cls_name, None)
+            if cls:
+                _int_aggs.append(cls)
+        if _int_aggs and isinstance(expr, tuple(_int_aggs)):
+            return "BIGINT"
+        # Literal values
+        if isinstance(expr, exp.Literal):
+            if expr.is_number:
+                return "NUMERIC"
+            if expr.is_string:
+                return "TEXT"
+        # Passthrough column reference — type inherited from source
+        if isinstance(expr, exp.Column):
+            return "INHERITED"
+        # CASE WHEN: try to infer from first THEN branch
+        if isinstance(expr, exp.Case):
+            for when in expr.args.get("ifs", []):
+                t = SQLLineageTracker._infer_type(when.args.get("true", when))
+                if t not in ("", "UNKNOWN", "INHERITED"):
+                    return t
+            return "UNKNOWN"
+        # Window function wrapper — infer from the underlying function
+        if isinstance(expr, exp.Window):
+            return SQLLineageTracker._infer_type(expr.this)
+        return "UNKNOWN"
 
     @staticmethod
     def _find_main_query(expr: exp.Expression) -> Optional[exp.Expression]:
@@ -334,6 +574,11 @@ class SQLLineageTracker:
                 real = src.name.lower()
                 alias = src.alias.lower() if src.alias else real
                 amap[alias] = real
+                
+                # Also register pivot aliases to point to the base table
+                for pivot in src.args.get("pivots") or []:
+                    if pivot.alias:
+                        amap[pivot.alias.lower()] = real
             elif isinstance(src, exp.Subquery):
                 alias = (src.alias or f"sq_{id(src)}").lower()
                 full_sq_name = f"[subquery] {alias}"
@@ -714,9 +959,11 @@ class SQLLineageTracker:
                     "joins": info.joins,
                     "is_union": info.is_union,
                     "union_branches": info.union_branches,
+                    "group_by": info.group_by,
                     "columns": [
                         {
                             "name": c.name,
+                            "data_type": c.data_type,
                             "expression": c.expression.strip(),
                             "sources": [f"{s_t}.{s_c}" for s_t, s_c in c.sources]
                         } for c in info.columns
@@ -864,7 +1111,7 @@ class SQLLineageTracker:
                 <option value="ALL">Show Entire Warehouse Lineage</option>
             </select>
             <label id="hide-cte-toggle" style="display: flex; align-items: center; gap: 8px; margin-top: 10px; cursor: pointer; user-select: none; color: #8b949e; font-size: 12px;">
-                <input type="checkbox" id="hide-intermediates" style="width: 14px; height: 14px; accent-color: #58a6ff; cursor: pointer;">
+                <input type="checkbox" id="hide-intermediates" checked style="width: 14px; height: 14px; accent-color: #58a6ff; cursor: pointer;">
                 Hide CTEs &amp; subqueries from list
             </label>
         </div>
@@ -1186,6 +1433,25 @@ class SQLLineageTracker:
                 }});
             }}
 
+            // ── GROUP BY ──────────────────────────────────────────────────
+            if (node.table_info.group_by && node.table_info.group_by.length > 0) {{
+                const gbLabel = document.createElement('div');
+                gbLabel.className = 'col-label';
+                gbLabel.textContent = 'GROUP BY';
+                filtersContainer.appendChild(gbLabel);
+
+                const gbWrap = document.createElement('div');
+                gbWrap.style.cssText = 'display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px;';
+                node.table_info.group_by.forEach(g => {{
+                    const tag = document.createElement('span');
+                    tag.style.cssText = 'font-family:monospace; font-size:12px; background:#1c2128; border:1px solid #2ea043;' +
+                        'color:#7ee787; padding:3px 10px; border-radius:8px; white-space:nowrap;';
+                    tag.textContent = g;
+                    gbWrap.appendChild(tag);
+                }});
+                filtersContainer.appendChild(gbWrap);
+            }}
+
             const colsContainer = document.getElementById('columns-container');
             colsContainer.innerHTML = '';
             
@@ -1193,10 +1459,33 @@ class SQLLineageTracker:
                 const card = document.createElement('div');
                 card.className = 'col-card';
                 
-                // Name
+                // Name + data type badge
                 const nameDiv = document.createElement('div');
                 nameDiv.className = 'col-name';
-                nameDiv.textContent = '🔑 ' + col.name;
+                nameDiv.style.cssText = 'display:flex; align-items:center; gap:8px; flex-wrap:wrap;';
+
+                const nameText = document.createElement('span');
+                nameText.textContent = '🔑 ' + col.name;
+                nameDiv.appendChild(nameText);
+
+                if (col.data_type && col.data_type !== 'INHERITED' && col.data_type !== 'UNKNOWN' && col.data_type !== '') {{
+                    const typeBadge = document.createElement('span');
+                    typeBadge.textContent = col.data_type;
+                    const typeColors = {{
+                        'BIGINT': '#1f6feb', 'INTEGER': '#1f6feb', 'INT': '#1f6feb', 'SMALLINT': '#1f6feb',
+                        'NUMERIC': '#a371f7', 'FLOAT': '#a371f7', 'DOUBLE': '#a371f7', 'DECIMAL': '#a371f7', 'REAL': '#a371f7',
+                        'TEXT': '#2ea043', 'VARCHAR': '#2ea043', 'CHAR': '#2ea043',
+                        'DATE': '#d2a8ff', 'TIMESTAMP': '#d2a8ff', 'TIMESTAMPTZ': '#d2a8ff', 'TIME': '#d2a8ff',
+                        'BOOLEAN': '#f47067', 'BOOL': '#f47067',
+                    }};
+                    // Match prefix for VARCHAR(n), NUMERIC(p,s), etc.
+                    const baseType = col.data_type.replace(/\(.*\)/, '').trim();
+                    const bgColor = typeColors[baseType] || '#30363d';
+                    typeBadge.style.cssText = `background:${{bgColor}}22; color:${{bgColor}}; border:1px solid ${{bgColor}}55;` +
+                        `font-size:10px; font-weight:bold; font-family:monospace; padding:1px 7px; border-radius:6px; letter-spacing:0.5px;`;
+                    nameDiv.appendChild(typeBadge);
+                }}
+
                 card.appendChild(nameDiv);
                 
                 // Operation
