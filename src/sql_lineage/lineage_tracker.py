@@ -65,7 +65,10 @@ class TableInfo:
     source_tables: Set[str] = field(default_factory=set)
     sql_file: str = ""
     filters: List[str] = field(default_factory=list)
-    joins: List[str] = field(default_factory=list)
+    joins: List[Dict] = field(default_factory=list)  # [{left, right, condition, kind}]
+    is_union: bool = False
+    union_branches: List[Dict] = field(default_factory=list)  # [{table, operator}]
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -104,8 +107,13 @@ class SQLLineageTracker:
             print(f"  ⚠  Parse error in {filepath.name}: {exc}")
             return
         for stmt in stmts:
-            if stmt and isinstance(stmt, exp.Create):
+            if not stmt:
+                continue
+            if isinstance(stmt, exp.Create):
                 self._analyze_create(stmt, filepath.name)
+            elif isinstance(stmt, (exp.Select, exp.Union)):
+                table_name = filepath.stem.lower()
+                self._analyze_ctas(table_name, stmt, filepath.name)
 
     def _analyze_create(self, stmt: exp.Create, filename: str) -> None:
         # Table name lives inside the Schema wrapper
@@ -156,68 +164,154 @@ class SQLLineageTracker:
             short_name = (cte_node.alias or "").lower()
             if short_name:
                 cte_body = cte_node.this
-                if isinstance(cte_body, exp.Select):
+                if isinstance(cte_body, (exp.Select, exp.Union)):
                     full_cte_name = f"[cte] {short_name}"
                     cte_map[short_name] = full_cte_name
-                    self._analyze_select(full_cte_name, cte_body, filename, cte_map)
+                    self._analyze_query(full_cte_name, cte_body, filename, cte_map)
 
-        main_select = self._find_main_select(ctas_expr)
-        if main_select:
-            self._analyze_select(table_name, main_select, filename, cte_map)
+        main_query = self._find_main_query(ctas_expr)
+        if main_query:
+            self._analyze_query(table_name, main_query, filename, cte_map)
 
-    def _analyze_select(
-        self, table_name: str, select_node: exp.Select, filename: str, cte_map: Dict[str, str]
+    def _get_union_branches(self, node: exp.Expression) -> List[Tuple]:
+        """Recursively flatten a Union/Intersect/Except tree into [(Select, operator_label)].
+        The first branch has operator=None; each subsequent branch has the operator
+        type that connects it to the previous one (e.g. 'UNION ALL', 'INTERSECT')."""
+        if isinstance(node, exp.Select):
+            return [(node, None)]
+        if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+            # Determine operator type
+            if isinstance(node, exp.Intersect):
+                op = "INTERSECT"
+            elif isinstance(node, exp.Except):
+                op = "EXCEPT"
+            else:
+                # exp.Union: distinct=True means UNION (dedup), False means UNION ALL
+                distinct = node.args.get("distinct")
+                op = "UNION" if distinct else "UNION ALL"
+
+            left = self._get_union_branches(node.this)
+            right = self._get_union_branches(node.expression)
+            # Tag the first item of the right side with the operator
+            if right:
+                right[0] = (right[0][0], op)
+            return left + right
+        return []
+
+    def _analyze_query(
+        self, table_name: str, query_node: exp.Expression, filename: str, cte_map: Dict[str, str]
     ) -> None:
-        alias_map = self._build_alias_map(select_node, filename, cte_map)
+        branch_tuples = self._get_union_branches(query_node)
+        if not branch_tuples:
+            return
+
+        all_columns: Dict[str, ColumnLineage] = {}
+        all_filters = []
+        all_joins: List[Dict] = []
+        all_sources: Set[str] = set()
+        union_branches: List[Dict] = []  # [{table, operator}]
         
-        filters = []
-        if select_node.args.get("where"):
-            filters.append(select_node.args["where"].sql(dialect=self.dialect))
-        if select_node.args.get("having"):
-            filters.append(select_node.args["having"].sql(dialect=self.dialect))
+        for select_node, operator in branch_tuples:
+            alias_map = self._build_alias_map(select_node, filename, cte_map)
             
-        joins_list = []
-        for join in select_node.args.get("joins") or []:
-            j_copy = join.copy()
-            if isinstance(j_copy.this, exp.Subquery):
-                alias = j_copy.this.alias or f"sq_{id(join.this)}"
-                j_copy.set("this", exp.Table(this=exp.Identifier(this=alias)))
-            joins_list.append(j_copy.sql(dialect=self.dialect))
-            
-        columns: List[ColumnLineage] = []
-        for sel_expr in select_node.expressions:
-            col = self._trace_output_column_shallow(sel_expr, alias_map, cte_map)
-            if col:
-                columns.append(col)
+            # Resolve FROM table name
+            from_clause = select_node.args.get("from_")
+            from_table = ""
+            if from_clause and isinstance(from_clause.this, exp.Table):
+                raw = from_clause.this.name.lower()
+                from_table = alias_map.get(from_clause.this.alias.lower() if from_clause.this.alias else raw, raw)
+            elif from_clause and isinstance(from_clause.this, exp.Subquery):
+                sq_alias = (from_clause.this.alias or "").lower()
+                from_table = alias_map.get(sq_alias, f"[subquery] {sq_alias}")
+
+            # Track union branch with operator label
+            if len(branch_tuples) > 1 and from_table:
+                union_branches.append({"table": from_table, "operator": operator})
+
+            if select_node.args.get("where"):
+                all_filters.append(select_node.args["where"].sql(dialect=self.dialect))
+            if select_node.args.get("having"):
+                all_filters.append(select_node.args["having"].sql(dialect=self.dialect))
                 
-        source_tables: Set[str] = set()
+            for join in select_node.args.get("joins") or []:
+                # Build full join type: [side] [kind] JOIN  e.g. LEFT JOIN, INNER JOIN, CROSS JOIN
+                side = str(join.args.get("side", "") or "").strip().upper()
+                kind = str(join.args.get("kind", "") or "").strip().upper()
+                parts = [p for p in [side, kind, "JOIN"] if p]
+                join_type = " ".join(parts)
+
+                join_src = join.this
+                if isinstance(join_src, exp.Subquery):
+                    right_name = (join_src.alias or f"sq_{id(join_src)}").lower()
+                    right_name = f"[subquery] {right_name}"
+                elif isinstance(join_src, exp.Table):
+                    raw_r = join_src.name.lower()
+                    right_name = alias_map.get(join_src.alias.lower() if join_src.alias else raw_r, raw_r)
+                else:
+                    right_name = join_src.sql(dialect=self.dialect)
+
+                # Extract ON / USING condition text
+                on_expr = join.args.get("on")
+                using_expr = join.args.get("using")
+                if on_expr:
+                    condition = on_expr.sql(dialect=self.dialect)
+                elif using_expr:
+                    condition = "USING (" + ", ".join(u.sql(dialect=self.dialect) for u in using_expr) + ")"
+                else:
+                    condition = ""
+
+                all_joins.append({
+                    "left": from_table,
+                    "right": right_name,
+                    "kind": join_type,
+                    "condition": condition
+                })
+                
+            for sel_expr in select_node.expressions:
+                col = self._trace_output_column_shallow(sel_expr, alias_map, cte_map)
+                if col:
+                    if col.name not in all_columns:
+                        all_columns[col.name] = col
+                    else:
+                        existing = all_columns[col.name]
+                        for src in col.sources:
+                            if src not in existing.sources:
+                                existing.sources.append(src)
+
+        columns = list(all_columns.values())
         for c in columns:
             for st, _ in c.sources:
-                source_tables.add(st)
-
+                all_sources.add(st)
+                
         self.tables[table_name] = TableInfo(
             name=table_name,
             columns=columns,
             is_source=False,
-            source_tables=source_tables,
+            source_tables=all_sources,
             sql_file=filename,
-            filters=filters,
-            joins=joins_list
+            filters=all_filters,
+            joins=all_joins,
+            is_union=len(branch_tuples) > 1,
+            union_branches=union_branches
         )
         print(
             f"  ✅ {filename:<35} → parsed node:     {table_name}  "
-            f"({len(columns)} cols)"
+            f"({len(columns)} cols, {len(branch_tuples)} branches)"
         )
 
     # ── AST helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _find_main_select(expr: exp.Expression) -> Optional[exp.Select]:
-        """Unwrap Subquery / With wrappers to get the main SELECT."""
-        if isinstance(expr, exp.Select):
+    def _find_main_query(expr: exp.Expression) -> Optional[exp.Expression]:
+        """Unwrap Subquery / With wrappers to get the main SELECT or UNION."""
+        if isinstance(expr, (exp.Select, exp.Union)):
             return expr
         if isinstance(expr, exp.Subquery):
-            return SQLLineageTracker._find_main_select(expr.this)
+            return SQLLineageTracker._find_main_query(expr.this)
+        # Try to find a Union first, since Union wraps Selects
+        u = expr.find(exp.Union)
+        if u:
+            return u
         return expr.find(exp.Select)
 
     def _build_alias_map(self, select: exp.Select, filename: str, cte_map: Dict[str, str]) -> Dict[str, str]:
@@ -246,7 +340,7 @@ class SQLLineageTracker:
                 amap[alias] = full_sq_name
                 
                 if isinstance(src.this, exp.Select):
-                    self._analyze_select(full_sq_name, src.this, filename, cte_map)
+                    self._analyze_query(full_sq_name, src.this, filename, cte_map)
                     # Register subquery itself in the CTE map so guess_table knows it's a valid local node
                     cte_map[full_sq_name] = full_sq_name
 
@@ -618,6 +712,8 @@ class SQLLineageTracker:
                     "sql_file": info.sql_file,
                     "filters": info.filters,
                     "joins": info.joins,
+                    "is_union": info.is_union,
+                    "union_branches": info.union_branches,
                     "columns": [
                         {
                             "name": c.name,
@@ -767,6 +863,10 @@ class SQLLineageTracker:
             <select id="table-filter" style="width: 100%; padding: 10px; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-size: 14px;">
                 <option value="ALL">Show Entire Warehouse Lineage</option>
             </select>
+            <label id="hide-cte-toggle" style="display: flex; align-items: center; gap: 8px; margin-top: 10px; cursor: pointer; user-select: none; color: #8b949e; font-size: 12px;">
+                <input type="checkbox" id="hide-intermediates" style="width: 14px; height: 14px; accent-color: #58a6ff; cursor: pointer;">
+                Hide CTEs &amp; subqueries from list
+            </label>
         </div>
         
         <div id="empty-state" class="empty-state">
@@ -776,6 +876,7 @@ class SQLLineageTracker:
         <div id="table-details" class="hidden">
             <h2 id="table-name">Table Name</h2>
             <div id="table-badge" class="badge">file.sql</div>
+            <div id="union-badge" class="badge" style="background: #a371f7; display: none; margin-left: 5px;">UNION</div>
             
             <div id="joins-container" style="margin-bottom: 20px;"></div>
             <div id="filters-container" style="margin-bottom: 20px;"></div>
@@ -816,13 +917,38 @@ class SQLLineageTracker:
         
         // Populate filter dropdown
         const filterSelect = document.getElementById('table-filter');
+        const hideIntermediates = document.getElementById('hide-intermediates');
         const sortedNodes = [...graphData.nodes].sort((a, b) => a.id.localeCompare(b.id));
-        sortedNodes.forEach(n => {{
-            const opt = document.createElement('option');
-            opt.value = n.id;
-            opt.textContent = n.id;
-            filterSelect.appendChild(opt);
-        }});
+        
+        function isIntermediate(nodeId) {{
+            return nodeId.startsWith('[cte]') || nodeId.startsWith('[subquery]');
+        }}
+        
+        function populateDropdown() {{
+            const hideChecked = hideIntermediates.checked;
+            // Keep the current selection if possible
+            const currentVal = filterSelect.value;
+            // Remove all options except the first ("Show Entire...")
+            while (filterSelect.options.length > 1) {{
+                filterSelect.remove(1);
+            }}
+            sortedNodes.forEach(n => {{
+                if (hideChecked && isIntermediate(n.id)) return;
+                const opt = document.createElement('option');
+                opt.value = n.id;
+                opt.textContent = n.id;
+                filterSelect.appendChild(opt);
+            }});
+            // Restore selection if it's still in the list, else reset to ALL
+            if ([...filterSelect.options].some(o => o.value === currentVal)) {{
+                filterSelect.value = currentVal;
+            }} else {{
+                filterSelect.value = 'ALL';
+            }}
+        }}
+        
+        populateDropdown();
+        hideIntermediates.addEventListener('change', populateDropdown);
         
         // Setup vis.js network
         const container = document.getElementById('network');
@@ -960,6 +1086,88 @@ class SQLLineageTracker:
             
             document.getElementById('table-name').textContent = node.id;
             document.getElementById('table-badge').textContent = '📄 ' + node.table_info.sql_file;
+            document.getElementById('union-badge').style.display = node.table_info.is_union ? 'inline-block' : 'none';
+            
+            // ── Union branches ────────────────────────────────────────────
+            const joinsContainer = document.getElementById('joins-container');
+            joinsContainer.innerHTML = '';
+
+            if (node.table_info.is_union && node.table_info.union_branches && node.table_info.union_branches.length > 0) {{
+                const uLabel = document.createElement('div');
+                uLabel.className = 'col-label';
+                uLabel.textContent = 'Combined Tables';
+                joinsContainer.appendChild(uLabel);
+
+                const uWrap = document.createElement('div');
+                uWrap.style.cssText = 'display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:14px;';
+                node.table_info.union_branches.forEach((branch, i) => {{
+                    // Show operator badge BEFORE the table (except for the first branch)
+                    if (branch.operator) {{
+                        const sep = document.createElement('span');
+                        sep.textContent = branch.operator;
+                        // Color by operator type
+                        const opColors = {{
+                            'UNION ALL':  '#1f6feb',
+                            'UNION':      '#388bfd',
+                            'INTERSECT':  '#2ea043',
+                            'EXCEPT':     '#da3633'
+                        }};
+                        sep.style.cssText = `background:${{opColors[branch.operator] || '#6e40c9'}}; color:#fff;` +
+                            `padding:2px 8px; border-radius:6px; font-size:11px; font-weight:bold; letter-spacing:0.5px; white-space:nowrap;`;
+                        uWrap.appendChild(sep);
+                    }}
+                    const tag = document.createElement('span');
+                    tag.className = 'source-tag';
+                    tag.style.background = '#6e40c9';
+                    tag.textContent = branch.table;
+                    uWrap.appendChild(tag);
+                }});
+                joinsContainer.appendChild(uWrap);
+            }}
+
+            // ── Join logic ────────────────────────────────────────────────
+            if (node.table_info.joins && node.table_info.joins.length > 0) {{
+                const jLabel = document.createElement('div');
+                jLabel.className = 'col-label';
+                jLabel.textContent = 'Join Logic';
+                joinsContainer.appendChild(jLabel);
+                
+                node.table_info.joins.forEach(j => {{
+                    const card = document.createElement('div');
+                    card.style.cssText = 'background:#161b22; border:1px solid #a371f7; border-radius:8px; padding:12px; margin-bottom:10px;';
+
+                    // Header row: LEFT ← KIND → RIGHT
+                    const header = document.createElement('div');
+                    header.style.cssText = 'display:flex; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap;';
+
+                    const leftTag = document.createElement('span');
+                    leftTag.textContent = j.left || '?';
+                    leftTag.style.cssText = 'background:#1f6feb; color:#fff; padding:3px 10px; border-radius:12px; font-size:12px; font-family:monospace;';
+
+                    const kindTag = document.createElement('span');
+                    kindTag.textContent = j.kind || 'JOIN';
+                    kindTag.style.cssText = 'background:#a371f7; color:#fff; padding:3px 8px; border-radius:6px; font-size:11px; font-weight:bold; letter-spacing:0.5px;';
+
+                    const rightTag = document.createElement('span');
+                    rightTag.textContent = j.right || '?';
+                    rightTag.style.cssText = 'background:#1f6feb; color:#fff; padding:3px 10px; border-radius:12px; font-size:12px; font-family:monospace;';
+
+                    header.appendChild(leftTag);
+                    header.appendChild(kindTag);
+                    header.appendChild(rightTag);
+                    card.appendChild(header);
+
+                    // Condition
+                    if (j.condition) {{
+                        const cond = document.createElement('div');
+                        cond.style.cssText = 'font-family:monospace; font-size:12px; color:#8b949e; white-space:pre-wrap; word-break:break-all;';
+                        cond.textContent = j.condition;
+                        card.appendChild(cond);
+                    }}
+
+                    joinsContainer.appendChild(card);
+                }});
+            }}
             
             const filtersContainer = document.getElementById('filters-container');
             filtersContainer.innerHTML = '';
@@ -977,24 +1185,7 @@ class SQLLineageTracker:
                     filtersContainer.appendChild(code);
                 }});
             }}
-            
-            const joinsContainer = document.getElementById('joins-container');
-            joinsContainer.innerHTML = '';
-            if (node.table_info.joins && node.table_info.joins.length > 0) {{
-                const jLabel = document.createElement('div');
-                jLabel.className = 'col-label';
-                jLabel.textContent = 'Join Logic';
-                joinsContainer.appendChild(jLabel);
-                
-                node.table_info.joins.forEach(j => {{
-                    const code = document.createElement('div');
-                    code.className = 'code-block';
-                    code.style.borderColor = '#a371f7';
-                    code.textContent = j;
-                    joinsContainer.appendChild(code);
-                }});
-            }}
-            
+
             const colsContainer = document.getElementById('columns-container');
             colsContainer.innerHTML = '';
             
