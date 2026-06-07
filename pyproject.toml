@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sql-lineage = "sql_lineage.lineage_tracker:main"
+sql-lineage = "sql_lineage.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sql_lineage"]
