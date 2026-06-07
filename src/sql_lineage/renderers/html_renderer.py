@@ -57,6 +57,7 @@ class HtmlRenderer:
                     "borderWidth": 2,
                     "table_info": {
                         "sql_file": info.sql_file,
+                        "source_tables": sorted(info.source_tables),
                         "filters": info.filters,
                         "joins": info.joins,
                         "is_union": info.is_union,
@@ -179,6 +180,7 @@ _HTML_TEMPLATE = """\
             <h2 id="table-name">Table Name</h2>
             <div id="table-badge" class="badge">file.sql</div>
             <div id="union-badge" class="badge" style="background:#a371f7;display:none;margin-left:5px;">UNION</div>
+            <div id="input-tables-container" style="margin-bottom:0;"></div> 
             <div id="joins-container" style="margin-bottom:20px;"></div>
             <div id="filters-container" style="margin-bottom:20px;"></div>
             <div id="columns-container"></div>
@@ -276,6 +278,36 @@ _HTML_TEMPLATE = """\
             document.getElementById('table-badge').textContent = '📄 ' + node.table_info.sql_file;
             document.getElementById('union-badge').style.display = node.table_info.is_union ? 'inline-block' : 'none';
 
+            // ── Input Tables ──────────────────────────────────────────────────────
+            const inputTablesContainer = document.getElementById('input-tables-container');
+            inputTablesContainer.innerHTML = '';
+            const inputSources = node.table_info.source_tables;
+            if (inputSources?.length > 0) {{
+                const lbl = document.createElement('div'); lbl.className = 'col-label'; lbl.textContent = 'Input Tables'; inputTablesContainer.appendChild(lbl);
+                const wrap = document.createElement('div'); wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:20px;';
+                inputSources.forEach(src => {{
+                    const tag = document.createElement('span');
+                    tag.className = 'source-tag';
+                    tag.style.cssText += ';background:#1f6feb;font-size:13px;padding:4px 12px;';
+                    tag.textContent = '⬅ ' + src;
+                    if (data.nodes.get(src)) {{
+                        tag.style.cursor = 'pointer';
+                        tag.title = 'Click to jump to ' + src;
+                        tag.addEventListener('mouseenter', () => {{ tag.style.opacity = '0.7'; }});
+                        tag.addEventListener('mouseleave', () => {{ tag.style.opacity = '1'; }});
+                        tag.addEventListener('click', () => {{
+                            network.selectNodes([src]);
+                            network.focus(src, {{
+                                scale: 1.2,
+                                animation: {{ duration: 600, easingFunction: 'easeInOutQuad' }}
+                            }});
+                            showTableDetails(data.nodes.get(src));
+                        }});
+                    }}
+                    wrap.appendChild(tag);
+                }});
+                inputTablesContainer.appendChild(wrap);
+            }}
             const joinsContainer = document.getElementById('joins-container');
             joinsContainer.innerHTML = '';
 
