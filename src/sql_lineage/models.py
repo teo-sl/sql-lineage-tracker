@@ -31,4 +31,4 @@ class TableInfo:
     joins: List[Dict] = field(default_factory=list)  # [{left, right, condition, kind}]
     is_union: bool = False
     union_branches: List[Dict] = field(default_factory=list)  # [{table, operator}]
-    group_by: List[str] = field(default_factory=list)
+    group_by: List[Dict] = field(default_factory=list) 

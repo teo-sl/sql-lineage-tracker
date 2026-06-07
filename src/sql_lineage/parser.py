@@ -307,26 +307,32 @@ class SQLParser:
         self,
         select_node: exp.Select,
         alias_map: Dict[str, str],
-        all_group_by: List[str],
+        all_group_by: List[Dict],  # era List[str]
     ) -> None:
         group_node = select_node.args.get("group")
         if not group_node:
             return
         for g_expr in group_node.expressions:
             g_copy = g_expr.copy()
+            
+            # Collect all table.column sources referenced in this expression
+            sources = []
             for col in g_copy.find_all(exp.Column):
-                # Resolve the table alias to the real table name
                 if col.table:
                     resolved = alias_map.get(col.table.lower(), col.table.lower())
                 else:
-                    # No explicit table prefix — guess from alias_map
                     resolved = self._guess_table(col.name.lower(), alias_map, {})
-                # Force table.column notation
                 col.set("table", exp.to_identifier(resolved))
+                ref = f"{resolved}.{col.name.lower()}"
+                if ref not in sources:
+                    sources.append(ref)
 
-            g_sql = g_copy.sql(dialect=self.dialect)
-            if g_sql not in all_group_by:
-                all_group_by.append(g_sql)
+            entry = {
+                "expression": g_copy.sql(dialect=self.dialect),
+                "sources": sources,
+            }
+            if entry not in all_group_by:
+                all_group_by.append(entry)
 
     def _collect_joins(
         self,

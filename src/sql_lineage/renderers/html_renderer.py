@@ -323,7 +323,48 @@ _HTML_TEMPLATE = """\
             if (node.table_info.group_by?.length > 0) {{
                 const lbl = document.createElement('div'); lbl.className = 'col-label'; lbl.textContent = 'GROUP BY'; filtersContainer.appendChild(lbl);
                 const wrap = document.createElement('div'); wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;';
-                node.table_info.group_by.forEach(g => {{ const tag = document.createElement('span'); tag.style.cssText = 'font-family:monospace;font-size:12px;background:#1c2128;border:1px solid #2ea043;color:#7ee787;padding:3px 10px;border-radius:8px;white-space:nowrap;'; tag.textContent = g; wrap.appendChild(tag); }});
+                node.table_info.group_by.forEach(g => {{
+                    const card = document.createElement('div');
+                    card.style.cssText = 'background:#1c2128;border:1px solid #2ea043;border-radius:8px;padding:8px 12px;margin-bottom:4px;width:100%;box-sizing:border-box;';
+
+                    // Expression label
+                    const exprDiv = document.createElement('div');
+                    exprDiv.style.cssText = 'font-family:monospace;font-size:12px;color:#7ee787;margin-bottom:6px;';
+                    exprDiv.textContent = g.expression;
+                    card.appendChild(exprDiv);
+
+                    // Clickable source refs
+                    if (g.sources?.length > 0) {{
+                        const refsDiv = document.createElement('div');
+                        refsDiv.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;';
+                        g.sources.forEach(src => {{
+                            const tag = document.createElement('span');
+                            tag.className = 'source-tag';
+                            tag.textContent = src;
+
+                            const dotIdx = src.lastIndexOf('.');
+                            const tableName = dotIdx > 0 ? src.substring(0, dotIdx) : null;
+
+                            if (tableName && data.nodes.get(tableName)) {{
+                                tag.style.cursor = 'pointer';
+                                tag.title = 'Click to jump to ' + tableName;
+                                tag.addEventListener('mouseenter', () => {{ tag.style.opacity = '0.7'; }});
+                                tag.addEventListener('mouseleave', () => {{ tag.style.opacity = '1'; }});
+                                tag.addEventListener('click', () => {{
+                                    network.selectNodes([tableName]);
+                                    network.focus(tableName, {{
+                                        scale: 1.2,
+                                        animation: {{ duration: 600, easingFunction: 'easeInOutQuad' }}
+                                    }});
+                                    showTableDetails(data.nodes.get(tableName));
+                                }});
+                            }}
+                            refsDiv.appendChild(tag);
+                        }});
+                        card.appendChild(refsDiv);
+                    }}
+                    wrap.appendChild(card);
+                }});
                 filtersContainer.appendChild(wrap);
             }}
 
