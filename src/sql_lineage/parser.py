@@ -226,16 +226,72 @@ class SQLParser:
             pivot_columns = self._extract_pivot_columns(select_node, from_table)
 
             for sel_expr in select_node.expressions:
-                if isinstance(sel_expr, exp.Star) and pivot_columns:
-                    for pcol, (pexpr, pdtype) in pivot_columns.items():
-                        if pcol not in all_columns:
-                            all_columns[pcol] = ColumnLineage(
-                                name=pcol,
-                                expression=pexpr,
-                                sources=[(from_table, pcol)],
-                                data_type=pdtype,
-                            )
+                # ── Star expansion: SELECT * or SELECT tbl.* ─────────────────
+                is_plain_star = isinstance(sel_expr, exp.Star)
+                is_qualified_star = (
+                    isinstance(sel_expr, exp.Column)
+                    and isinstance(sel_expr.this, exp.Star)
+                )
+                if is_plain_star or is_qualified_star:
+                    # Which tables contribute? Qualified star pins one table;
+                    # plain star expands all sources in scope.
+                    if is_qualified_star and sel_expr.table:
+                        raw_ref = sel_expr.table.lower()
+                        real_ref = alias_map.get(raw_ref, raw_ref)
+                        if real_ref in cte_map:
+                            real_ref = cte_map[real_ref]
+                        star_tables = [real_ref]
+                    else:
+                        # plain * — every source in alias_map
+                        star_tables = []
+                        for raw, real in alias_map.items():
+                            resolved = cte_map.get(real, real)
+                            if resolved not in star_tables:
+                                star_tables.append(resolved)
+
+                    expanded_any = False
+                    for tref in star_tables:
+                        src_info = self.tables.get(tref)
+                        if src_info:
+                            for src_col in src_info.columns:
+                                if src_col.name not in all_columns:
+                                    all_columns[src_col.name] = ColumnLineage(
+                                        name=src_col.name,
+                                        expression=f"{tref}.{src_col.name}",
+                                        sources=[(tref, src_col.name)],
+                                        data_type="INHERITED",
+                                    )
+                                expanded_any = True
+
+                    if not expanded_any:
+                        # Source not yet registered (forward reference or unknown).
+                        # Emit a placeholder so the table still appears in lineage.
+                        if is_qualified_star and sel_expr.table:
+                            raw_ref = sel_expr.table.lower()
+                            real_ref = alias_map.get(raw_ref, raw_ref)
+                            if real_ref in cte_map:
+                                real_ref = cte_map[real_ref]
+                            placeholder = f"{real_ref}.*"
+                            if placeholder not in all_columns:
+                                all_columns[placeholder] = ColumnLineage(
+                                    name=placeholder,
+                                    expression=placeholder,
+                                    sources=[(real_ref, "*")],
+                                    data_type="UNKNOWN",
+                                )
+                        else:
+                            # Pivot fallback for plain * (original behaviour)
+                            if pivot_columns:
+                                for pcol, (pexpr, pdtype) in pivot_columns.items():
+                                    if pcol not in all_columns:
+                                        all_columns[pcol] = ColumnLineage(
+                                            name=pcol,
+                                            expression=pexpr,
+                                            sources=[(from_table, pcol)],
+                                            data_type=pdtype,
+                                        )
                     continue
+                # ── end star expansion ────────────────────────────────────────
 
                 col = self._trace_output_column(sel_expr, alias_map, cte_map)
                 if not col:
@@ -261,6 +317,8 @@ class SQLParser:
             for st, _ in c.sources:
                 all_sources.add(st)
 
+        # Also include tables that only appear in JOINs (no column selected from
+        # them directly, e.g. `SELECT t2.* FROM a t2 JOIN b t3 ON …`).
         for join_info in all_joins:
             right = join_info.get("right", "")
             if right:
@@ -353,7 +411,17 @@ class SQLParser:
 
             join_src = join.this
             if isinstance(join_src, exp.Subquery):
-                right_name = f"[subquery] {(join_src.alias or f'sq_{id(join_src)}').lower()}"
+                if join_src.alias:
+                    sq_alias = join_src.alias.lower()
+                elif (
+                    isinstance(join_src.this, exp.Select)
+                    and join_src.this.args.get("from_")
+                    and isinstance(join_src.this.args["from_"].this, exp.Table)
+                ):
+                    sq_alias = join_src.this.args["from_"].this.name.lower()
+                else:
+                    sq_alias = f"sq_{id(join_src)}"
+                right_name = f"[subquery] {sq_alias}"
             elif isinstance(join_src, exp.Table):
                 raw_r = join_src.name.lower()
                 right_name = alias_map.get(
@@ -484,7 +552,19 @@ class SQLParser:
                     if pivot.alias:
                         amap[pivot.alias.lower()] = real
             elif isinstance(src, exp.Subquery):
-                alias = (src.alias or f"sq_{id(src)}").lower()
+                # Prefer the explicit alias; if absent, try to derive a stable
+                # name from the single table inside the subquery instead of
+                # falling back to the unstable sq_<id(…)> sentinel.
+                if src.alias:
+                    alias = src.alias.lower()
+                elif (
+                    isinstance(src.this, exp.Select)
+                    and src.this.args.get("from_")
+                    and isinstance(src.this.args["from_"].this, exp.Table)
+                ):
+                    alias = src.this.args["from_"].this.name.lower()
+                else:
+                    alias = f"sq_{id(src)}"
                 full_sq_name = f"[subquery] {alias}"
                 amap[alias] = full_sq_name
                 if isinstance(src.this, exp.Select):
