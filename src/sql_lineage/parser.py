@@ -315,10 +315,15 @@ class SQLParser:
         for g_expr in group_node.expressions:
             g_copy = g_expr.copy()
             for col in g_copy.find_all(exp.Column):
+                # Resolve the table alias to the real table name
                 if col.table:
-                    resolved = alias_map.get(col.table.lower())
-                    if resolved:
-                        col.set("table", exp.to_identifier(resolved))
+                    resolved = alias_map.get(col.table.lower(), col.table.lower())
+                else:
+                    # No explicit table prefix — guess from alias_map
+                    resolved = self._guess_table(col.name.lower(), alias_map, {})
+                # Force table.column notation
+                col.set("table", exp.to_identifier(resolved))
+
             g_sql = g_copy.sql(dialect=self.dialect)
             if g_sql not in all_group_by:
                 all_group_by.append(g_sql)
