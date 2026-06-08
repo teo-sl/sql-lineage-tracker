@@ -175,6 +175,9 @@ class SQLParser:
     def _analyze_ctas(
         self, table_name: str, ctas_expr: exp.Expression, filename: str
     ) -> None:
+        # cte_map is LOCAL to this CTAS: maps short CTE name -> scoped key in
+        # self.tables.  Scoping by table_name prevents collisions when two files
+        # both define a CTE with the same short name (e.g. "base", "joined").
         cte_map: Dict[str, str] = {}
 
         for cte_node in ctas_expr.find_all(exp.CTE):
@@ -182,14 +185,14 @@ class SQLParser:
             if short_name:
                 cte_body = cte_node.this
                 if isinstance(cte_body, (exp.Select, exp.Union)):
-                    full_cte_name = f"[cte] {short_name}"
+                    # Unique key: [cte:parent_table] short_name
+                    full_cte_name = f"[cte:{table_name}] {short_name}"
                     cte_map[short_name] = full_cte_name
                     self._analyze_query(full_cte_name, cte_body, filename, cte_map)
 
         main_query = self._find_main_query(ctas_expr)
         if main_query:
             self._analyze_query(table_name, main_query, filename, cte_map)
-
     # ─────────────────────────────────────────────────────────────
     # Query analysis (SELECT / UNION)
     # ─────────────────────────────────────────────────────────────
@@ -213,7 +216,7 @@ class SQLParser:
         all_group_by: List[str] = []
 
         for select_node, operator in branch_tuples:
-            alias_map = self._build_alias_map(select_node, filename, cte_map)
+            alias_map = self._build_alias_map(select_node, filename, cte_map, parent_table=table_name)
             from_table = self._extract_from_table(select_node, alias_map)
 
             if len(branch_tuples) > 1 and from_table:
@@ -357,6 +360,7 @@ class SQLParser:
             return alias_map.get(key, raw)
         if isinstance(from_clause.this, exp.Subquery):
             sq_alias = (from_clause.this.alias or "").lower()
+            # alias_map already holds the scoped [subquery:parent] key.
             return alias_map.get(sq_alias, f"[subquery] {sq_alias}")
         return ""
 
@@ -411,6 +415,8 @@ class SQLParser:
 
             join_src = join.this
             if isinstance(join_src, exp.Subquery):
+                # Resolve through alias_map so the key matches the scoped
+                # [subquery:parent] name already registered by _build_alias_map.
                 if join_src.alias:
                     sq_alias = join_src.alias.lower()
                 elif (
@@ -421,7 +427,9 @@ class SQLParser:
                     sq_alias = join_src.this.args["from_"].this.name.lower()
                 else:
                     sq_alias = f"sq_{id(join_src)}"
-                right_name = f"[subquery] {sq_alias}"
+                # Prefer the already-scoped name from alias_map; fall back
+                # to a bare label only if somehow not present.
+                right_name = alias_map.get(sq_alias, f"[subquery] {sq_alias}")
             elif isinstance(join_src, exp.Table):
                 raw_r = join_src.name.lower()
                 right_name = alias_map.get(
@@ -529,6 +537,7 @@ class SQLParser:
         select: exp.Select,
         filename: str,
         cte_map: Dict[str, str],
+        parent_table: str = "",
     ) -> Dict[str, str]:
         """Return ``{alias: real_table_name}`` for the immediate FROM/JOIN sources."""
         if not isinstance(select, exp.Select):
@@ -565,7 +574,10 @@ class SQLParser:
                     alias = src.this.args["from_"].this.name.lower()
                 else:
                     alias = f"sq_{id(src)}"
-                full_sq_name = f"[subquery] {alias}"
+                # Scope by parent table so two files with the same subquery
+                # alias do not collide in self.tables.
+                scope = parent_table or alias
+                full_sq_name = f"[subquery:{scope}] {alias}"
                 amap[alias] = full_sq_name
                 if isinstance(src.this, exp.Select):
                     self._analyze_query(full_sq_name, src.this, filename, cte_map)

@@ -203,7 +203,7 @@ _HTML_TEMPLATE = """\
         const hideIntermediates = document.getElementById('hide-intermediates');
         const sortedNodes = [...graphData.nodes].sort((a, b) => a.id.localeCompare(b.id));
 
-        function isIntermediate(id) {{ return id.startsWith('[cte]') || id.startsWith('[subquery]'); }}
+        function isIntermediate(id) {{ return id.startsWith('[cte]') || id.startsWith('[cte:') || id.startsWith('[subquery]') || id.startsWith('[subquery:'); }}
 
         function populateDropdown() {{
             const hide = hideIntermediates.checked;
@@ -224,10 +224,22 @@ _HTML_TEMPLATE = """\
         const container = document.getElementById('network');
         const data = {{ nodes: new vis.DataSet(graphData.nodes), edges: new vis.DataSet(graphData.edges) }};
         const network = new vis.Network(container, data, {{
-            layout: {{ hierarchical: {{ enabled: true, direction: 'LR', sortMethod: 'directed', nodeSpacing: 100, levelSeparation: 350 }} }},
-            physics: false,
+            layout: {{ hierarchical: {{ enabled: true, direction: 'LR', sortMethod: 'directed', nodeSpacing: 220, levelSeparation: 480, treeSpacing: 250, blockShifting: true, edgeMinimization: true, parentCentralization: true }} }},
+            physics: {{
+                enabled: true,
+                hierarchicalRepulsion: {{
+                    nodeDistance: 220,
+                    centralGravity: 0.0,
+                    springLength: 100,
+                    springConstant: 0.01,
+                    damping: 0.09
+                }},
+                solver: 'hierarchicalRepulsion',
+                stabilization: {{ iterations: 400, updateInterval: 25, fit: true }}
+            }},
             interaction: {{ hover: true, navigationButtons: true, keyboard: true, zoomView: true, dragView: true }}
         }});
+        network.once('stabilized', () => network.setOptions({{ physics: false }}));
 
         // ── Filter ────────────────────────────────────────────────────────
         filterSelect.addEventListener('change', e => {{

@@ -10,6 +10,7 @@ Produces:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections import defaultdict
 from typing import Dict, Optional, Set, Tuple
@@ -42,14 +43,28 @@ _EDGE_PALETTE = ["#f47067", "#d2a8ff", "#ffa657", "#79c0ff", "#7ee787", "#ff9bce
 
 
 def get_layer(name: str) -> str:
-    if name.startswith("[cte]"):
+    # Match both old "[cte]" and new scoped "[cte:parent]" prefixes
+    if re.match(r"^\[cte[:\]]", name):
         return "cte"
-    if name.startswith("[subquery]"):
+    if re.match(r"^\[subquery[:\]]", name):
         return "sub"
     for prefix in ("raw", "stg", "int", "mart"):
         if name.startswith(prefix):
             return prefix
     return "raw"
+
+
+def _node_id(name: str) -> str:
+    """Return a DOT-safe node ID for *name*.
+
+    Graphviz node IDs that contain colons, brackets, or spaces must be
+    carefully quoted -- and colons inside an ID still confuse the port
+    syntax even when the whole string is double-quoted.  The safest
+    approach is to replace every non-alphanumeric character with an
+    underscore, which guarantees a valid bare identifier while keeping
+    the string recognisably related to the original name.
+    """
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
 def build_html_table_label(
@@ -122,12 +137,12 @@ class GraphvizRenderer:
         dot.attr("edge", color="#30363d", penwidth="2", arrowsize="0.8")
 
         for name, info in self.tables.items():
-            dot.node(name, label=build_html_table_label(info))
+            dot.node(_node_id(name), label=build_html_table_label(info))
 
         for name, info in self.tables.items():
             edge_color = LAYER_STYLE.get(get_layer(name), LAYER_STYLE["raw"])["hdr"]
             for src in info.source_tables:
-                dot.edge(src, name, color=edge_color, penwidth="2.2")
+                dot.edge(_node_id(src), _node_id(name), color=edge_color, penwidth="2.2")
 
         return self._save(dot, output_dir, "table_lineage", "📊 Table lineage")
 
@@ -180,10 +195,10 @@ class GraphvizRenderer:
             info = self.tables.get(tname)
             if not info:
                 continue
-            dot.node(tname, label=build_html_table_label(info, highlight_cols=table_cols.get(tname)))
+            dot.node(_node_id(tname), label=build_html_table_label(info, highlight_cols=table_cols.get(tname)))
 
         for i, (st, sc, tt, tc) in enumerate(sorted(edges)):
-            dot.edge(f"{st}:{sc}:e", f"{tt}:{tc}:w", color=_EDGE_PALETTE[i % len(_EDGE_PALETTE)])
+            dot.edge(f"{_node_id(st)}:{sc}:e", f"{_node_id(tt)}:{tc}:w", color=_EDGE_PALETTE[i % len(_EDGE_PALETTE)])
 
         label = f"📊 Column lineage ({target or 'ALL'})"
         return self._save(dot, output_dir, filename, label)
@@ -234,10 +249,10 @@ class GraphvizRenderer:
             tinfo = self.tables.get(tname)
             if not tinfo:
                 continue
-            dot.node(tname, label=build_html_table_label(tinfo, highlight_cols=table_cols.get(tname)))
+            dot.node(_node_id(tname), label=build_html_table_label(tinfo, highlight_cols=table_cols.get(tname)))
 
         for i, (st, sc, tc) in enumerate(sorted(edges)):
-            dot.edge(f"{st}:{sc}:e", f"{target}:{tc}:w", color=_EDGE_PALETTE[i % len(_EDGE_PALETTE)])
+            dot.edge(f"{_node_id(st)}:{sc}:e", f"{_node_id(target)}:{tc}:w", color=_EDGE_PALETTE[i % len(_EDGE_PALETTE)])
 
         return self._save(dot, output_dir, f"deep_lineage_{target}", "📊 Deep lineage")
 
