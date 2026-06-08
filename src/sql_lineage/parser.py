@@ -180,6 +180,12 @@ class SQLParser:
         # both define a CTE with the same short name (e.g. "base", "joined").
         cte_map: Dict[str, str] = {}
 
+        # Flat scope used for ALL subquery names produced from this file.
+        # Using the filename stem (e.g. "mart_customer_360") instead of the
+        # (potentially already-nested) parent_table name prevents the
+        # [subquery:[subquery:…] …] explosion for deeply-nested subqueries.
+        file_scope = Path(filename).stem.lower()
+
         for cte_node in ctas_expr.find_all(exp.CTE):
             short_name = (cte_node.alias or "").lower()
             if short_name:
@@ -188,11 +194,11 @@ class SQLParser:
                     # Unique key: [cte:parent_table] short_name
                     full_cte_name = f"[cte:{table_name}] {short_name}"
                     cte_map[short_name] = full_cte_name
-                    self._analyze_query(full_cte_name, cte_body, filename, cte_map)
+                    self._analyze_query(full_cte_name, cte_body, filename, cte_map, file_scope=file_scope)
 
         main_query = self._find_main_query(ctas_expr)
         if main_query:
-            self._analyze_query(table_name, main_query, filename, cte_map)
+            self._analyze_query(table_name, main_query, filename, cte_map, file_scope=file_scope)
     # ─────────────────────────────────────────────────────────────
     # Query analysis (SELECT / UNION)
     # ─────────────────────────────────────────────────────────────
@@ -203,6 +209,7 @@ class SQLParser:
         query_node: exp.Expression,
         filename: str,
         cte_map: Dict[str, str],
+        file_scope: str = "",
     ) -> None:
         branch_tuples = self._get_union_branches(query_node)
         if not branch_tuples:
@@ -216,7 +223,7 @@ class SQLParser:
         all_group_by: List[str] = []
 
         for select_node, operator in branch_tuples:
-            alias_map = self._build_alias_map(select_node, filename, cte_map, parent_table=table_name)
+            alias_map = self._build_alias_map(select_node, filename, cte_map, parent_table=table_name, file_scope=file_scope)
             from_table = self._extract_from_table(select_node, alias_map)
 
             if len(branch_tuples) > 1 and from_table:
@@ -427,8 +434,9 @@ class SQLParser:
                     sq_alias = join_src.this.args["from_"].this.name.lower()
                 else:
                     sq_alias = f"sq_{id(join_src)}"
-                # Prefer the already-scoped name from alias_map; fall back
-                # to a bare label only if somehow not present.
+                # Prefer the already-scoped name from alias_map (registered by
+                # _build_alias_map with the flat [subquery:<file_scope>] prefix);
+                # fall back to a bare label only if somehow not present.
                 right_name = alias_map.get(sq_alias, f"[subquery] {sq_alias}")
             elif isinstance(join_src, exp.Table):
                 raw_r = join_src.name.lower()
@@ -538,8 +546,17 @@ class SQLParser:
         filename: str,
         cte_map: Dict[str, str],
         parent_table: str = "",
+        file_scope: str = "",
     ) -> Dict[str, str]:
-        """Return ``{alias: real_table_name}`` for the immediate FROM/JOIN sources."""
+        """Return ``{alias: real_table_name}`` for the immediate FROM/JOIN sources.
+
+        Subquery nodes are named ``[subquery:<file_scope>] <alias>`` where
+        *file_scope* is the SQL file's stem (e.g. ``mart_customer_360``).
+        Using the flat file stem instead of the parent-table name prevents
+        the ``[subquery:[subquery:…]…]`` explosion for deeply-nested queries.
+        Two subqueries in the same file with the same alias are disambiguated
+        by a counter suffix (``_2``, ``_3``, …).
+        """
         if not isinstance(select, exp.Select):
             return {}
 
@@ -574,13 +591,22 @@ class SQLParser:
                     alias = src.this.args["from_"].this.name.lower()
                 else:
                     alias = f"sq_{id(src)}"
-                # Scope by parent table so two files with the same subquery
-                # alias do not collide in self.tables.
-                scope = parent_table or alias
-                full_sq_name = f"[subquery:{scope}] {alias}"
+
+                # Use the flat file stem as scope so nested subqueries don't
+                # inherit the (already-nested) parent_table name.
+                scope = file_scope or Path(filename).stem.lower()
+                base_sq_name = f"[subquery:{scope}] {alias}"
+
+                # Disambiguate if two subqueries in the same file share an alias.
+                full_sq_name = base_sq_name
+                counter = 2
+                while full_sq_name in self.tables and self.tables[full_sq_name].sql_file != filename:
+                    full_sq_name = f"{base_sq_name}_{counter}"
+                    counter += 1
+
                 amap[alias] = full_sq_name
                 if isinstance(src.this, exp.Select):
-                    self._analyze_query(full_sq_name, src.this, filename, cte_map)
+                    self._analyze_query(full_sq_name, src.this, filename, cte_map, file_scope=scope)
                     cte_map[full_sq_name] = full_sq_name
 
         return amap
