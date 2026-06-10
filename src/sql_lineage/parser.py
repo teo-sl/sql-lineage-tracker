@@ -228,6 +228,9 @@ class SQLParser:
 
             if len(branch_tuples) > 1 and from_table:
                 union_branches.append({"table": from_table, "operator": operator})
+                # Ensure every UNION branch source is tracked even when its
+                # columns are fully deduplicated by the star-expansion path.
+                all_sources.add(from_table)
 
             self._collect_filters(select_node, all_filters)
             self._collect_group_by(select_node, alias_map, all_group_by)
@@ -264,13 +267,19 @@ class SQLParser:
                         src_info = self.tables.get(tref)
                         if src_info:
                             for src_col in src_info.columns:
+                                new_src = (tref, src_col.name)
                                 if src_col.name not in all_columns:
                                     all_columns[src_col.name] = ColumnLineage(
                                         name=src_col.name,
                                         expression=f"{tref}.{src_col.name}",
-                                        sources=[(tref, src_col.name)],
+                                        sources=[new_src],
                                         data_type="INHERITED",
                                     )
+                                else:
+                                    # UNION branch: accumulate sources from all branches
+                                    existing = all_columns[src_col.name]
+                                    if new_src not in existing.sources:
+                                        existing.sources.append(new_src)
                                 expanded_any = True
 
                     if not expanded_any:
@@ -366,7 +375,20 @@ class SQLParser:
             key = from_clause.this.alias.lower() if from_clause.this.alias else raw
             return alias_map.get(key, raw)
         if isinstance(from_clause.this, exp.Subquery):
-            sq_alias = (from_clause.this.alias or "").lower()
+            sq = from_clause.this
+            # Derive the lookup key using the same logic as _build_alias_map so
+            # that alias-less subqueries (whose alias was derived from their
+            # inner FROM table name) are resolved correctly.
+            if sq.alias:
+                sq_alias = sq.alias.lower()
+            elif (
+                isinstance(sq.this, exp.Select)
+                and sq.this.args.get("from_")
+                and isinstance(sq.this.args["from_"].this, exp.Table)
+            ):
+                sq_alias = sq.this.args["from_"].this.name.lower()
+            else:
+                sq_alias = ""
             # alias_map already holds the scoped [subquery:parent] key.
             return alias_map.get(sq_alias, f"[subquery] {sq_alias}")
         return ""
