@@ -6,6 +6,7 @@ Usage
     uv run sql-lineage examples/sql/
     uv run sql-lineage examples/sql/ --target mart_customer_360
     uv run sql-lineage examples/sql/ -o output/ -f svg -i
+    uv run sql-lineage examples/sql/ --graphical
 """
 
 from __future__ import annotations
@@ -48,6 +49,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also generate an interactive HTML graph",
     )
+    ap.add_argument(
+        "--graphical", "-g",
+        action="store_true",
+        help="generate PNG/SVG/PDF graph files (default: off)",
+    )
     return ap
 
 
@@ -65,16 +71,20 @@ def main(argv=None) -> int:
 
     target = args.target or list(tracker.tables.keys())[-1]
 
-    print("🎨  Generating visualisations …\n")
-    tracker.render_table_lineage(output_dir=args.output_dir, fmt=args.format)
-    tracker.render_column_lineage(output_dir=args.output_dir, fmt=args.format)
-    tracker.render_column_lineage(output_dir=args.output_dir, fmt=args.format, target=target)
-    tracker.render_deep_lineage(target=target, output_dir=args.output_dir, fmt=args.format)
+    if args.graphical:
+        print("🎨  Generating visualisations …\n")
+        tracker.render_table_lineage(output_dir=args.output_dir, fmt=args.format)
+        tracker.render_column_lineage(output_dir=args.output_dir, fmt=args.format)
+        tracker.render_column_lineage(output_dir=args.output_dir, fmt=args.format, target=target)
+        tracker.render_deep_lineage(target=target, output_dir=args.output_dir, fmt=args.format)
 
     if args.interactive:
         tracker.render_interactive_html(output_dir=args.output_dir)
 
-    print(f"\n✨  Done! Check the '{args.output_dir}/' directory.\n")
+    if args.graphical or args.interactive:
+        print(f"\n✨  Done! Check the '{args.output_dir}/' directory.\n")
+    else:
+        print("\n✨  Done!\n")
     return 0
 
 
