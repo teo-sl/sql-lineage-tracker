@@ -156,6 +156,30 @@ _HTML_TEMPLATE = """\
             text-align: center; color: #8b949e; margin-top: 50%;
             font-size: 16px; line-height: 1.5;
         }}
+        #field-search {{
+            width: 100%; padding: 9px 12px 9px 34px; box-sizing: border-box;
+            background: #0d1117; color: #c9d1d9;
+            border: 1px solid #30363d; border-radius: 6px;
+            font-size: 13px; outline: none; transition: border-color .2s;
+        }}
+        #field-search:focus {{ border-color: #58a6ff; }}
+        #field-search-wrap {{
+            position: relative; margin-bottom: 12px;
+        }}
+        #field-search-wrap::before {{
+            content: '🔍';
+            position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+            font-size: 13px; pointer-events: none;
+        }}
+        #field-search-count {{
+            font-size: 11px; color: #8b949e;
+            text-align: right; margin-top: 4px; min-height: 16px;
+        }}
+        .col-card.hidden-by-search {{ display: none !important; }}
+        .search-highlight {{
+            background: #f0c040; color: #0d1117;
+            border-radius: 3px; padding: 0 2px;
+        }}
     </style>
 </head>
 <body>
@@ -183,6 +207,13 @@ _HTML_TEMPLATE = """\
             <div id="input-tables-container" style="margin-bottom:0;"></div> 
             <div id="joins-container" style="margin-bottom:20px;"></div>
             <div id="filters-container" style="margin-bottom:20px;"></div>
+            <div id="field-search-section" style="display:none;margin-bottom:8px;">
+                <div class="col-label" style="margin-bottom:6px;">Search Fields</div>
+                <div id="field-search-wrap">
+                    <input id="field-search" type="search" placeholder="Filter columns by name, type or source…" autocomplete="off">
+                </div>
+                <div id="field-search-count"></div>
+            </div>
             <div id="columns-container"></div>
         </div>
     </div>
@@ -459,6 +490,58 @@ _HTML_TEMPLATE = """\
                 }}
                 colsContainer.appendChild(card);
             }});
+
+            // ── Field search ──────────────────────────────────────────────────
+            const searchSection = document.getElementById('field-search-section');
+            const searchInput   = document.getElementById('field-search');
+            const searchCount   = document.getElementById('field-search-count');
+
+            // Show search bar only when there are columns
+            searchSection.style.display = node.table_info.columns.length > 0 ? '' : 'none';
+            searchInput.value = '';
+            searchCount.textContent = '';
+
+            function escapeRe(s) {{ return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&'); }}
+
+            function highlightText(el, term) {{
+                // Strip previous highlights
+                el.innerHTML = el.textContent;
+                if (!term) return;
+                const re = new RegExp('(' + escapeRe(term) + ')', 'gi');
+                el.innerHTML = el.textContent.replace(re, '<mark class="search-highlight">$1</mark>');
+            }}
+
+            function applySearch() {{
+                const term = searchInput.value.trim().toLowerCase();
+                const cards = colsContainer.querySelectorAll('.col-card');
+                let visible = 0;
+                cards.forEach(card => {{
+                    // Build searchable text from name + type badge + source tags + code blocks
+                    const text = card.textContent.toLowerCase();
+                    const match = !term || text.includes(term);
+                    card.classList.toggle('hidden-by-search', !match);
+                    if (match) {{
+                        visible++;
+                        // Highlight inside col-name span
+                        const nameSpan = card.querySelector('.col-name span');
+                        if (nameSpan) highlightText(nameSpan, term);
+                        // Highlight inside source tags
+                        card.querySelectorAll('.source-tag').forEach(t => highlightText(t, term));
+                        // Highlight inside code blocks
+                        card.querySelectorAll('.code-block').forEach(t => highlightText(t, term));
+                    }} else {{
+                        // Restore plain text on hidden cards
+                        const nameSpan = card.querySelector('.col-name span');
+                        if (nameSpan) nameSpan.textContent = nameSpan.textContent;
+                    }}
+                }});
+                searchCount.textContent = term
+                    ? `${{visible}} of ${{cards.length}} column${{cards.length !== 1 ? 's' : ''}} match`
+                    : '';
+            }}
+
+            searchInput.removeEventListener('input', applySearch);
+            searchInput.addEventListener('input', applySearch);
         }}
 
         network.once('afterDrawing', () => {{ if (graphData.nodes.length > 0) network.fit({{animation: true}}); }});
