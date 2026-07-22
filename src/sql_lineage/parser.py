@@ -622,7 +622,7 @@ class SQLParser:
                 # Disambiguate if two subqueries in the same file share an alias.
                 full_sq_name = base_sq_name
                 counter = 2
-                while full_sq_name in self.tables and self.tables[full_sq_name].sql_file != filename:
+                while full_sq_name in self.tables:
                     full_sq_name = f"{base_sq_name}_{counter}"
                     counter += 1
 
