@@ -1,4 +1,4 @@
-create table ta_test_union as
+create table ta_test_union_2 as
 with ct1 as (
     select customer_id
     from raw_customers
@@ -10,12 +10,11 @@ with ct2 as (
     where phone='1234'
 ) 
 select * from (
-    select customer_id, 'a1' as label 
-    from ct1
-
-) as st1
-union all
+    select customer_id from raw_customers
+    where phone='1234'
+) as t1
+union
 select * from (
-    select customer_id, 'a2' as label
-    from ct2
-) as st2;
+    select customer_id from raw_customers
+    where phone='1235'
+) as t2
