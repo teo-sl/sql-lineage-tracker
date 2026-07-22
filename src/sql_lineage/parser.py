@@ -125,7 +125,7 @@ class SQLParser:
                 continue
             if isinstance(stmt, exp.Create):
                 self._analyze_create(stmt, filepath.name)
-            elif isinstance(stmt, (exp.Select, exp.Union)):
+            elif isinstance(stmt, (exp.Select, exp.Union, exp.Intersect, exp.Except)):
                 self._analyze_ctas(filepath.stem.lower(), stmt, filepath.name)
 
     def _analyze_create(self, stmt: exp.Create, filename: str) -> None:
@@ -190,7 +190,7 @@ class SQLParser:
             short_name = (cte_node.alias or "").lower()
             if short_name:
                 cte_body = cte_node.this
-                if isinstance(cte_body, (exp.Select, exp.Union)):
+                if isinstance(cte_body, (exp.Select, exp.Union, exp.Intersect, exp.Except)):
                     # Unique key: [cte:parent_table] short_name
                     full_cte_name = f"[cte:{table_name}] {short_name}"
                     cte_map[short_name] = full_cte_name
@@ -222,7 +222,7 @@ class SQLParser:
         union_branches: List[Dict] = []
         all_group_by: List[str] = []
 
-        for select_node, operator in branch_tuples:
+        for idx, (select_node, operator) in enumerate(branch_tuples):
             alias_map = self._build_alias_map(select_node, filename, cte_map, parent_table=table_name, file_scope=file_scope)
             from_table = self._extract_from_table(select_node, alias_map)
 
@@ -232,7 +232,14 @@ class SQLParser:
                 # columns are fully deduplicated by the star-expansion path.
                 all_sources.add(from_table)
 
-            self._collect_filters(select_node, all_filters)
+            prefix = ""
+            if len(branch_tuples) > 1:
+                if operator:
+                    prefix = f"[{operator} branch: {from_table}] "
+                else:
+                    prefix = f"[Branch {idx + 1}: {from_table}] "
+
+            self._collect_filters(select_node, all_filters, alias_map, cte_map, prefix=prefix)
             self._collect_group_by(select_node, alias_map, all_group_by)
             self._collect_joins(select_node, from_table, alias_map, all_joins)
 
@@ -393,11 +400,29 @@ class SQLParser:
             return alias_map.get(sq_alias, f"[subquery] {sq_alias}")
         return ""
 
-    def _collect_filters(self, select_node: exp.Select, all_filters: List[str]) -> None:
-        if select_node.args.get("where"):
-            all_filters.append(select_node.args["where"].sql(dialect=self.dialect))
-        if select_node.args.get("having"):
-            all_filters.append(select_node.args["having"].sql(dialect=self.dialect))
+    def _collect_filters(
+        self,
+        select_node: exp.Select,
+        all_filters: List[str],
+        alias_map: Dict[str, str],
+        cte_map: Dict[str, str],
+        prefix: str = "",
+    ) -> None:
+        for key in ("where", "having"):
+            node = select_node.args.get(key)
+            if node:
+                node_copy = node.copy()
+                for col in node_copy.find_all(exp.Column):
+                    if col.table:
+                        raw_table = col.table.lower()
+                        resolved = alias_map.get(raw_table, raw_table)
+                    else:
+                        resolved = self._guess_table(col.name.lower(), alias_map, cte_map)
+                    
+                    if resolved in cte_map:
+                        resolved = cte_map[resolved]
+                    col.set("table", exp.to_identifier(resolved))
+                all_filters.append(prefix + node_copy.sql(dialect=self.dialect))
 
     def _collect_group_by(
         self,
@@ -437,6 +462,7 @@ class SQLParser:
         alias_map: Dict[str, str],
         all_joins: List[Dict],
     ) -> None:
+        joined_tables = [from_table]
         for join in select_node.args.get("joins") or []:
             side = str(join.args.get("side", "") or "").strip().upper()
             kind = str(join.args.get("kind", "") or "").strip().upper()
@@ -471,7 +497,15 @@ class SQLParser:
             on_expr = join.args.get("on")
             using_expr = join.args.get("using")
             if on_expr:
-                condition = on_expr.sql(dialect=self.dialect)
+                on_copy = on_expr.copy()
+                for col in on_copy.find_all(exp.Column):
+                    if col.table:
+                        raw_table = col.table.lower()
+                        resolved = alias_map.get(raw_table, raw_table)
+                    else:
+                        resolved = self._guess_table(col.name.lower(), alias_map, {})
+                    col.set("table", exp.to_identifier(resolved))
+                condition = on_copy.sql(dialect=self.dialect)
             elif using_expr:
                 condition = "USING (" + ", ".join(
                     u.sql(dialect=self.dialect) for u in using_expr
@@ -479,9 +513,11 @@ class SQLParser:
             else:
                 condition = ""
 
+            left_str = " + ".join(joined_tables)
             all_joins.append(
-                {"left": from_table, "right": right_name, "kind": join_type, "condition": condition}
+                {"left": left_str, "right": right_name, "kind": join_type, "condition": condition}
             )
+            joined_tables.append(right_name)
 
     def _extract_pivot_columns(
         self, select_node: exp.Select, from_table: str
@@ -697,10 +733,10 @@ class SQLParser:
 
     @staticmethod
     def _find_main_query(expr: exp.Expression) -> Optional[exp.Expression]:
-        """Unwrap Subquery/With wrappers to reach the main SELECT or UNION."""
-        if isinstance(expr, (exp.Select, exp.Union)):
+        """Unwrap Subquery/With wrappers to reach the main SELECT or set operation."""
+        if isinstance(expr, (exp.Select, exp.Union, exp.Intersect, exp.Except)):
             return expr
         if isinstance(expr, exp.Subquery):
             return SQLParser._find_main_query(expr.this)
-        u = expr.find(exp.Union)
+        u = expr.find((exp.Union, exp.Intersect, exp.Except))
         return u if u else expr.find(exp.Select)
