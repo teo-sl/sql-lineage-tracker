@@ -288,9 +288,23 @@ _HTML_TEMPLATE = """\
             }}
             let visible;
             if (directSourcesOnly.checked) {{
-                // Show only the target node + its immediate FROM-clause sources (one hop upstream)
+                // Walk through internal CTEs/subqueries freely,
+                // but treat real (non-intermediate) tables as terminal leaves:
+                // include them in the graph but do NOT follow their edges.
                 visible = new Set([target]);
-                graphData.edges.forEach(e => {{ if (e.to === target) visible.add(e.from); }});
+                const queue = [target];
+                while (queue.length) {{
+                    const cur = queue.pop();
+                    graphData.edges.forEach(e => {{
+                        if (e.to === cur && !visible.has(e.from)) {{
+                            visible.add(e.from);
+                            // Only continue traversal if the upstream node is itself
+                            // an intermediate (CTE / subquery) — i.e. part of the
+                            // current table's own definition.
+                            if (isIntermediate(e.from)) queue.push(e.from);
+                        }}
+                    }});
+                }}
             }} else {{
                 // Full upstream lineage walk
                 visible = new Set([target]);
