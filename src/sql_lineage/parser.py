@@ -388,14 +388,17 @@ class SQLParser:
             # inner FROM table name) are resolved correctly.
             if sq.alias:
                 sq_alias = sq.alias.lower()
-            elif (
-                isinstance(sq.this, exp.Select)
-                and sq.this.args.get("from_")
-                and isinstance(sq.this.args["from_"].this, exp.Table)
-            ):
-                sq_alias = sq.this.args["from_"].this.name.lower()
             else:
-                sq_alias = ""
+                # Body may be a Union/Intersect/Except — walk to leftmost Select
+                inner = self._leftmost_select(sq.this)
+                if (
+                    inner is not None
+                    and inner.args.get("from_")
+                    and isinstance(inner.args["from_"].this, exp.Table)
+                ):
+                    sq_alias = inner.args["from_"].this.name.lower()
+                else:
+                    sq_alias = ""
             # alias_map already holds the scoped [subquery:parent] key.
             return alias_map.get(sq_alias, f"[subquery] {sq_alias}")
         return ""
@@ -474,14 +477,17 @@ class SQLParser:
                 # [subquery:parent] name already registered by _build_alias_map.
                 if join_src.alias:
                     sq_alias = join_src.alias.lower()
-                elif (
-                    isinstance(join_src.this, exp.Select)
-                    and join_src.this.args.get("from_")
-                    and isinstance(join_src.this.args["from_"].this, exp.Table)
-                ):
-                    sq_alias = join_src.this.args["from_"].this.name.lower()
                 else:
-                    sq_alias = f"sq_{id(join_src)}"
+                    # Body may be Union/Intersect/Except — walk to leftmost Select
+                    inner = self._leftmost_select(join_src.this)
+                    if (
+                        inner is not None
+                        and inner.args.get("from_")
+                        and isinstance(inner.args["from_"].this, exp.Table)
+                    ):
+                        sq_alias = inner.args["from_"].this.name.lower()
+                    else:
+                        sq_alias = f"sq_{id(join_src)}"
                 # Prefer the already-scoped name from alias_map (registered by
                 # _build_alias_map with the flat [subquery:<file_scope>] prefix);
                 # fall back to a bare label only if somehow not present.
@@ -598,6 +604,17 @@ class SQLParser:
     # Alias map
     # ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _leftmost_select(node: exp.Expression) -> Optional[exp.Select]:
+        """Walk a Union/Intersect/Except tree and return its leftmost Select branch.
+
+        Returns *node* unchanged if it is already an ``exp.Select``, or
+        ``None`` if no Select can be found.
+        """
+        while isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+            node = node.this  # always the left child
+        return node if isinstance(node, exp.Select) else None
+
     def _build_alias_map(
         self,
         select: exp.Select,
@@ -636,19 +653,21 @@ class SQLParser:
                     if pivot.alias:
                         amap[pivot.alias.lower()] = real
             elif isinstance(src, exp.Subquery):
-                # Prefer the explicit alias; if absent, try to derive a stable
-                # name from the single table inside the subquery instead of
-                # falling back to the unstable sq_<id(…)> sentinel.
+                # Prefer the explicit alias; if absent, walk to the leftmost
+                # Select of the body (handles both plain SELECTs and UNION ALL
+                # / set-op bodies) to derive a stable name from its FROM table.
                 if src.alias:
                     alias = src.alias.lower()
-                elif (
-                    isinstance(src.this, exp.Select)
-                    and src.this.args.get("from_")
-                    and isinstance(src.this.args["from_"].this, exp.Table)
-                ):
-                    alias = src.this.args["from_"].this.name.lower()
                 else:
-                    alias = f"sq_{id(src)}"
+                    inner = self._leftmost_select(src.this)
+                    if (
+                        inner is not None
+                        and inner.args.get("from_")
+                        and isinstance(inner.args["from_"].this, exp.Table)
+                    ):
+                        alias = inner.args["from_"].this.name.lower()
+                    else:
+                        alias = f"sq_{id(src)}"
 
                 # Use the flat file stem as scope so nested subqueries don't
                 # inherit the (already-nested) parent_table name.
@@ -663,8 +682,11 @@ class SQLParser:
                     counter += 1
 
                 amap[alias] = full_sq_name
-                if isinstance(src.this, exp.Select):
-                    self._analyze_query(full_sq_name, src.this, filename, cte_map, file_scope=scope)
+                # Analyse the subquery body — accept both a plain Select and any
+                # set-operation (Union / Intersect / Except) at the top level.
+                body = src.this
+                if isinstance(body, (exp.Select, exp.Union, exp.Intersect, exp.Except)):
+                    self._analyze_query(full_sq_name, body, filename, cte_map, file_scope=scope)
                     cte_map[full_sq_name] = full_sq_name
 
         return amap
