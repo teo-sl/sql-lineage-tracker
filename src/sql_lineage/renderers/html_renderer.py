@@ -195,6 +195,10 @@ _HTML_TEMPLATE = """\
                 <input type="checkbox" id="hide-intermediates" checked style="width:14px;height:14px;accent-color:#58a6ff;cursor:pointer;">
                 Hide CTEs &amp; subqueries from list
             </label>
+            <label id="direct-sources-toggle" style="display:flex;align-items:center;gap:8px;margin-top:8px;cursor:pointer;user-select:none;color:#8b949e;font-size:12px;" title="When checked, selecting a table shows only that table and its immediate FROM-clause sources (no full upstream lineage).">
+                <input type="checkbox" id="direct-sources-only" checked style="width:14px;height:14px;accent-color:#f0883e;cursor:pointer;">
+                Direct sources only <span style="color:#f0883e;font-size:10px;margin-left:2px;">&#9650;</span>
+            </label>
         </div>
         <div id="empty-state" class="empty-state">
             <div style="font-size:40px;margin-bottom:20px;">👈</div>
@@ -273,19 +277,28 @@ _HTML_TEMPLATE = """\
         network.once('stabilized', () => network.setOptions({{ physics: false }}));
 
         // ── Filter ────────────────────────────────────────────────────────
-        filterSelect.addEventListener('change', e => {{
-            const target = e.target.value;
+        const directSourcesOnly = document.getElementById('direct-sources-only');
+
+        function applyTableFilter(target) {{
             hideTableDetails(); network.unselectAll();
             if (target === 'ALL') {{
                 data.nodes.clear(); data.edges.clear();
                 data.nodes.add(graphData.nodes); data.edges.add(graphData.edges);
                 network.fit({{animation: true}}); return;
             }}
-            const visible = new Set([target]);
-            const queue = [target];
-            while (queue.length) {{
-                const cur = queue.pop();
-                graphData.edges.forEach(e => {{ if (e.to === cur && !visible.has(e.from)) {{ visible.add(e.from); queue.push(e.from); }} }});
+            let visible;
+            if (directSourcesOnly.checked) {{
+                // Show only the target node + its immediate FROM-clause sources (one hop upstream)
+                visible = new Set([target]);
+                graphData.edges.forEach(e => {{ if (e.to === target) visible.add(e.from); }});
+            }} else {{
+                // Full upstream lineage walk
+                visible = new Set([target]);
+                const queue = [target];
+                while (queue.length) {{
+                    const cur = queue.pop();
+                    graphData.edges.forEach(e => {{ if (e.to === cur && !visible.has(e.from)) {{ visible.add(e.from); queue.push(e.from); }} }});
+                }}
             }}
             data.nodes.clear(); data.edges.clear();
             data.nodes.add(graphData.nodes.filter(n => visible.has(n.id)));
@@ -293,6 +306,14 @@ _HTML_TEMPLATE = """\
             network.selectNodes([target]);
             showTableDetails(data.nodes.get(target));
             setTimeout(() => network.fit({{animation: true}}), 100);
+        }}
+
+        filterSelect.addEventListener('change', e => applyTableFilter(e.target.value));
+
+        // Re-apply filter when the Direct Sources Only checkbox is toggled
+        directSourcesOnly.addEventListener('change', () => {{
+            const cur = filterSelect.value;
+            if (cur !== 'ALL') applyTableFilter(cur);
         }});
 
         // ── Click / hover ─────────────────────────────────────────────────
