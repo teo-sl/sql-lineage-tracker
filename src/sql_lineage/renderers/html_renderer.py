@@ -579,7 +579,16 @@ _HTML_TEMPLATE = """\
             searchInput.addEventListener('input', applySearch);
         }}
 
-        network.once('afterDrawing', () => {{ if (graphData.nodes.length > 0) network.fit({{animation: true}}); }});
+        network.once('afterDrawing', () =\u003e {{
+            // Auto-select the first real table in the dropdown on page load
+            const firstOption = [...filterSelect.options].find(o =\u003e o.value !== 'ALL');
+            if (firstOption) {{
+                filterSelect.value = firstOption.value;
+                applyTableFilter(firstOption.value);
+            }} else if (graphData.nodes.length \u003e 0) {{
+                network.fit({{animation: true}});
+            }}
+        }});
     </script>
 </body>
 </html>
